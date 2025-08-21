@@ -8,6 +8,10 @@ accounts:
    api_hash: '41c4648ec0193791c245f1543a221444'
    request_pause_min: 140
    request_pause_max: 190
+   account_daily_limit: 10
+   device_model: Xiaomi 13 Pro
+   system_version: Android 14
+   app_version: 10.9.1
 
 # Общие настройки
 settings:
