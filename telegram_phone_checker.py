@@ -45,7 +45,7 @@ def log_telegram_raw_response(response, context=""):
 
 # --- Файл для хранения лимитов аккаунтов ---
 ACCOUNT_LIMITS_FILE = "account_limits.json"
-ACCOUNT_DAILY_LIMIT = 50
+ACCOUNT_DAILY_LIMIT = 50  # Значение по умолчанию, если не задано в config.yaml
 
 def load_account_limits() -> Dict[str, Dict[str, int]]:
     """Загружает лимиты аккаунтов из файла."""
@@ -80,7 +80,7 @@ def get_today_str():
 
 class AccountManager:
     """Управляет множественными аккаунтами Telegram и их ротацией с учетом лимитов."""
-    
+
     def __init__(self, config_file: str = "config.yaml"):
         self.config_file = config_file
         self.accounts = []
@@ -88,8 +88,9 @@ class AccountManager:
         self.clients = {}  # Словарь для хранения активных клиентов
         self.batch_pause = 120  # Значение по умолчанию в секундах
         self.account_limits = load_account_limits()
+        self.account_daily_limits = {}  # phone_number -> daily_limit
         self.load_config()
-    
+
     def load_config(self):
         """Загружает конфигурацию из YAML файла или из .env."""
         if os.path.exists(self.config_file):
@@ -97,47 +98,68 @@ class AccountManager:
             try:
                 with open(self.config_file, 'r', encoding='utf-8') as file:
                     config = yaml.safe_load(file)
-                    
+                    if not config:
+                        logger.error("Конфигурационный файл пуст или некорректен.")
+                        self.load_from_env()
+                        return
                     # Загружаем аккаунты
                     if 'accounts' in config and config['accounts']:
                         self.accounts = config['accounts']
                         logger.info(f"Загружено {len(self.accounts)} аккаунтов из конфигурации")
-                    
+                        # Сохраняем лимиты для каждого аккаунта
+                        for acc in self.accounts:
+                            phone = acc.get('phone_number')
+                            limit = acc.get('account_daily_limit', ACCOUNT_DAILY_LIMIT)
+                            if phone:
+                                self.account_daily_limits[phone] = limit
+                    else:
+                        logger.error("В конфигурации не найдено ни одного аккаунта.")
+                        self.load_from_env()
+                        return
                     # Загружаем настройки пауз
-                    if 'settings' in config:
+                    if 'settings' in config and config['settings']:
                         self.batch_pause = config['settings'].get('batch_pause_seconds', 120)
                         logger.info(f"Пауза между батчами установлена: {self.batch_pause} секунд")
-                        
             except Exception as e:
                 logger.error(f"Ошибка при загрузке YAML конфигурации: {e}")
                 self.load_from_env()
         else:
             logger.info("YAML конфигурация не найдена, загрузка из .env")
             self.load_from_env()
-    
+
     def load_from_env(self):
         """Загружает конфигурацию из переменных окружения или запрашивает у пользователя."""
         api_id = os.getenv("API_ID")
         api_hash = os.getenv("API_HASH")
         phone_number = os.getenv("PHONE_NUMBER")
-        
+
         if not all([api_id, api_hash, phone_number]):
             logger.info("Введите данные для входа в Telegram:")
             api_id = api_id or input("Введите ваш API ID: ")
             api_hash = api_hash or input("Введите ваш API HASH: ")
             phone_number = phone_number or input("Введите ваш номер телефона: ")
-        
+
+        try:
+            api_id_int = int(api_id)
+        except Exception:
+            logger.critical("API_ID должен быть числом.")
+            sys.exit(1)
+
         self.accounts = [{
             'phone_number': phone_number,
-            'api_id': int(api_id),
+            'api_id': api_id_int,
             'api_hash': api_hash,
-            'session_name': f"{phone_number}"
+            'session_name': str(phone_number)  # Явно преобразуем в строку
         }]
-    
+        self.account_daily_limits[phone_number] = ACCOUNT_DAILY_LIMIT
+
     def get_account_limit(self, phone_number: str) -> int:
         today = get_today_str()
         return self.account_limits.get(phone_number, {}).get(today, 0)
-    
+
+    def get_account_daily_limit(self, phone_number: str) -> int:
+        return self.account_daily_limits.get(phone_number, ACCOUNT_DAILY_LIMIT)
+
     def increment_account_limit(self, phone_number: str, count: int):
         today = get_today_str()
         if phone_number not in self.account_limits:
@@ -146,7 +168,7 @@ class AccountManager:
             self.account_limits[phone_number][today] = 0
         self.account_limits[phone_number][today] += count
         save_account_limits(self.account_limits)
-    
+
     def get_next_account(self, batch_size: int = 1) -> Optional[Dict[str, Any]]:
         """
         Возвращает следующий аккаунт для использования, который не превысит лимит с учетом batch_size.
@@ -154,70 +176,100 @@ class AccountManager:
         """
         today = get_today_str()
         n = len(self.accounts)
+        if n == 0:
+            logger.critical("Нет доступных аккаунтов для работы.")
+            return None
+
         for offset in range(n):
             idx = (self.current_account_index + offset) % n
             account = self.accounts[idx]
-            phone = account['phone_number']
+            phone = account.get('phone_number')
+            if not phone:
+                continue
             used = self.account_limits.get(phone, {}).get(today, 0)
-            if used + batch_size <= ACCOUNT_DAILY_LIMIT:
+            # Используем лимит из настроек аккаунта, если он есть, иначе дефолтный
+            limit = self.get_account_daily_limit(phone)
+            if used + batch_size <= limit:
                 self.current_account_index = (idx + 1) % n
-                logger.info(f"Переключение на аккаунт: {phone} (сегодня использовано: {used}, лимит: {ACCOUNT_DAILY_LIMIT})")
+                logger.info(f"Переключение на аккаунт: {phone} (сегодня использовано: {used}, лимит: {limit})")
                 return account
         logger.warning("Нет аккаунтов с доступным лимитом для текущего батча.")
         return None
-    
+
     async def get_client(self, account: Dict[str, Any]) -> TelegramClient:
         """Получает или создает клиента для указанного аккаунта."""
         phone = account['phone_number']
-        
+
         # Если клиент уже существует и подключен, возвращаем его
-        if phone in self.clients and self.clients[phone].is_connected():
-            return self.clients[phone]
-        
+        if phone in self.clients:
+            client = self.clients[phone]
+            if hasattr(client, "is_connected") and client.is_connected():
+                return client
+
         # Создаем нового клиента
         client = await self.login_account(account)
         self.clients[phone] = client
         return client
-    
+
     async def login_account(self, account: Dict[str, Any]) -> TelegramClient:
         """Создает сессию Telethon для конкретного аккаунта."""
         logger.info(f"Вход в Telegram для аккаунта {account['phone_number']}...")
+
+        # Обеспечиваем что session_name всегда строка
+        session_name = str(account.get('session_name', account['phone_number']))
         
-        session_name = account.get('session_name', account['phone_number'])
+        # Убедимся что api_id - это целое число
+        api_id = account['api_id']
+        if isinstance(api_id, str):
+            try:
+                api_id = int(api_id)
+            except ValueError:
+                logger.critical(f"API_ID должен быть числом, получено: {api_id}")
+                raise
+        
+        # Убедимся что api_hash - это строка
+        api_hash = str(account['api_hash'])
+
         client = TelegramClient(
             session_name,
-            account['api_id'],
-            account['api_hash'],
-            device_model="Ubuntu",
-            system_version="23.04",
-            app_version="10.0.0"
+            api_id,
+            api_hash,
+            device_model=str(account.get("device_model", "Ubuntu")),
+            system_version=str(account.get("system_version", "23.04")),
+            app_version=str(account.get("app_version", "10.0.0"))
         )
-        
+
         await client.connect()
-        
+
         if not await client.is_user_authorized():
-            await client.send_code_request(account['phone_number'])
             try:
+                await client.send_code_request(account['phone_number'])
                 code = input(f"Введите код для {account['phone_number']}: ")
                 await client.sign_in(account['phone_number'], code)
             except errors.SessionPasswordNeededError:
                 pw = getpass(f"Двухфакторная аутентификация для {account['phone_number']}: ")
                 await client.sign_in(password=pw)
-        
+            except Exception as e:
+                logger.critical(f"Ошибка авторизации аккаунта {account['phone_number']}: {e}")
+                raise
+
         logger.info(f"Вход выполнен успешно для {account['phone_number']}")
         await asyncio.sleep(5)  # Задержка 5 секунд после входа
         # Дополнительная пауза перед началом проверки номеров
         logger.info("Пауза 10 секунд перед началом проверки номеров этим аккаунтом...")
         await asyncio.sleep(10)
         return client
-    
+
     async def disconnect_all(self):
         """Отключает все активные клиенты."""
         for phone, client in self.clients.items():
-            if client.is_connected():
-                logger.info(f"Отключение аккаунта {phone}...")
-                await client.disconnect()
-    
+            try:
+                if hasattr(client, "is_connected") and client.is_connected():
+                    logger.info(f"Отключение аккаунта {phone}...")
+                    await client.disconnect()
+            except Exception as e:
+                logger.error(f"Ошибка при отключении аккаунта {phone}: {e}")
+
     def save_example_config(self):
         """Создает пример конфигурационного файла."""
         example_config = {
@@ -225,12 +277,14 @@ class AccountManager:
                 {
                     'phone_number': '+1234567890',
                     'api_id': 12345678,
-                    'api_hash': 'your_api_hash_here'
+                    'api_hash': 'your_api_hash_here',
+                    'account_daily_limit': 50
                 },
                 {
                     'phone_number': '+0987654321',
                     'api_id': 87654321,
-                    'api_hash': 'another_api_hash_here'
+                    'api_hash': 'another_api_hash_here',
+                    'account_daily_limit': 100
                 }
             ],
             'settings': {
@@ -239,10 +293,10 @@ class AccountManager:
                 'request_pause_max': 180
             }
         }
-        
+
         with open('config.example.yaml', 'w', encoding='utf-8') as file:
             yaml.dump(example_config, file, default_flow_style=False, allow_unicode=True)
-        
+
         logger.info("Создан пример конфигурационного файла: config.example.yaml")
 
 
@@ -255,7 +309,17 @@ def get_human_readable_user_status(status: types.TypeUserStatus) -> str:
     if isinstance(status, types.UserStatusOnline):
         return "Currently online"
     elif isinstance(status, types.UserStatusOffline):
-        return status.was_online.strftime("%Y-%m-%d %H:%M:%S %Z")
+        # was_online может быть int (timestamp) или datetime
+        if hasattr(status, "was_online"):
+            if isinstance(status.was_online, datetime.datetime):
+                return status.was_online.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                try:
+                    dt = datetime.datetime.fromtimestamp(status.was_online)
+                    return dt.strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    return str(status.was_online)
+        return "Last seen offline"
     elif isinstance(status, types.UserStatusRecently):
         return "Last seen recently"
     elif isinstance(status, types.UserStatusLastWeek):
@@ -273,6 +337,19 @@ def get_random_russian_first_name() -> str:
         "Виталий", "Валерий", "Антон", "Василий", "Григорий", "Евгений", "Константин", "Леонид", "Олег", "Руслан"
     ]
     return random.choice(names)
+
+def safe_str_convert(value) -> str:
+    """Безопасно преобразует любое значение в строку."""
+    if value is None:
+        return ""
+    elif isinstance(value, (int, float, bool)):
+        return str(value)
+    elif isinstance(value, list):
+        return json.dumps(value, ensure_ascii=False) if value else ""
+    elif isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False)
+    else:
+        return str(value)
 
 async def get_names(
     client: TelegramClient, phone_number: str, download_profile_photos: bool = False
@@ -304,23 +381,40 @@ async def get_names(
             # Добавляем задержку перед удалением контакта
             logger.info("Пауза 3 секунды перед удалением контакта...")
             await asyncio.sleep(3)
-            
-            updates_response: types.Updates = await client(functions.contacts.DeleteContactsRequest(id=[users[0].get("id")]))
-            # Логируем сырой ответ DeleteContactsRequest
-            log_telegram_raw_response(updates_response, context=f"DeleteContactsRequest for {phone_number}")
-            user = updates_response.users[0]
-            result.update({
-                "id": user.id, "username": user.username, "usernames": user.usernames,
-                "first_name": user.first_name, "last_name": user.last_name, "fake": user.fake,
-                "verified": user.verified, "premium": user.premium, "mutual_contact": user.mutual_contact,
-                "bot": user.bot, "bot_chat_history": user.bot_chat_history, "restricted": user.restricted,
-                "restriction_reason": user.restriction_reason,
-                "user_was_online": get_human_readable_user_status(user.status),
-                "phone": user.phone,
-            })
-            if download_profile_photos:
-                # Логика загрузки фото (опционально)
-                pass  # Не реализовано
+            user_id = users[0].get("id")
+            if user_id is None:
+                result.update({"error": "Не удалось получить ID пользователя для удаления контакта."})
+            else:
+                updates_response = await client(functions.contacts.DeleteContactsRequest(id=[user_id]))
+                # Логируем сырой ответ DeleteContactsRequest
+                log_telegram_raw_response(updates_response, context=f"DeleteContactsRequest for {phone_number}")
+                # Получаем пользователя из ответа
+                user = None
+                if hasattr(updates_response, "users") and updates_response.users:
+                    user = updates_response.users[0]
+                if user:
+                    result.update({
+                        "id": getattr(user, "id", ""),
+                        "username": getattr(user, "username", ""),
+                        "usernames": getattr(user, "usernames", []),
+                        "first_name": getattr(user, "first_name", ""),
+                        "last_name": getattr(user, "last_name", ""),
+                        "fake": getattr(user, "fake", ""),
+                        "verified": getattr(user, "verified", ""),
+                        "premium": getattr(user, "premium", ""),
+                        "mutual_contact": getattr(user, "mutual_contact", ""),
+                        "bot": getattr(user, "bot", ""),
+                        "bot_chat_history": getattr(user, "bot_chat_history", ""),
+                        "restricted": getattr(user, "restricted", ""),
+                        "restriction_reason": getattr(user, "restriction_reason", ""),
+                        "user_was_online": get_human_readable_user_status(getattr(user, "status", None)),
+                        "phone": getattr(user, "phone", ""),
+                    })
+                    if download_profile_photos:
+                        # Логика загрузки фото (опционально)
+                        pass  # Не реализовано
+                else:
+                    result.update({"error": "Не удалось получить данные пользователя после удаления контакта."})
         else:
             result.update({"error": "На этот номер зарегистрировано несколько аккаунтов, что является непредвиденной ситуацией."})
     except TypeError as e:
@@ -328,13 +422,13 @@ async def get_names(
     except Exception as e:
         result.update({"error": f"Непредвиденная ошибка: {e}."})
         logger.error(f"Критическая ошибка при обработке {phone_number}: {e}")
-    
+
     return result
 
 
 async def validate_users(
-    client: TelegramClient, 
-    phone_numbers: List[str], 
+    client: TelegramClient,
+    phone_numbers: List[str],
     download_profile_photos: bool,
     pause_min: int = 120,
     pause_max: int = 180
@@ -349,13 +443,13 @@ async def validate_users(
         if clean_phone and clean_phone not in result:
             # Выполняем основную логику проверки номера
             result[clean_phone] = await get_names(client, clean_phone, download_profile_photos)
-            
+
             # Если это не последний номер в пачке, делаем паузу
             if i < len(phone_numbers):
                 sleep_duration = random.uniform(pause_min, pause_max)
                 logger.info(f"Пауза на {sleep_duration:.2f} секунд перед следующим номером...")
                 await asyncio.sleep(sleep_duration)
-                
+
     return result
 
 
@@ -371,9 +465,9 @@ def read_phone_numbers(csv_file_path: str, batch_size: int = 10) -> List[List[st
             reader = csv.reader(file)
             # Пропускаем заголовок, если он есть
             first_row = next(reader, None)
-            if not first_row: 
+            if not first_row:
                 return []  # Файл пуст
-            
+
             # Проверяем, является ли первая строка номером
             if first_row[0].strip().replace("+", "").isdigit():
                 current_batch = [first_row[0].strip()]
@@ -407,7 +501,7 @@ def write_header_if_needed(output_file: str):
             with open(output_file, 'w', encoding='utf-8', newline='') as file:
                 writer = csv.writer(file)
                 writer.writerow([
-                    'phone_number', 'found', 'id', 'username', 'usernames', 
+                    'phone_number', 'found', 'id', 'username', 'usernames',
                     'first_name', 'last_name', 'fake', 'verified', 'premium',
                     'mutual_contact', 'bot', 'bot_chat_history', 'restricted',
                     'restriction_reason', 'user_was_online', 'phone', 'error',
@@ -427,22 +521,43 @@ def parse_and_save_results(results_data: Dict[str, Any], output_file: str, check
                 if user_data and 'error' not in user_data:
                     usernames_list = user_data.get('usernames', [])
                     usernames_str = ""
-                    if usernames_list:
-                        usernames_str = json.dumps([u.get('username', '') for u in usernames_list if isinstance(u, dict)])
+                    if usernames_list and isinstance(usernames_list, list):
+                        # usernames может быть списком строк или объектов
+                        if all(isinstance(u, dict) for u in usernames_list):
+                            usernames_str = json.dumps([u.get('username', '') for u in usernames_list], ensure_ascii=False)
+                        else:
+                            usernames_str = json.dumps(usernames_list, ensure_ascii=False)
                     
                     row = [
-                        phone, "Yes", user_data.get('id', ''), user_data.get('username', ''),
-                        usernames_str, user_data.get('first_name', ''), user_data.get('last_name', ''),
-                        user_data.get('fake', ''), user_data.get('verified', ''), user_data.get('premium', ''),
-                        user_data.get('mutual_contact', ''), user_data.get('bot', ''),
-                        user_data.get('bot_chat_history', ''), user_data.get('restricted', ''),
-                        str(user_data.get('restriction_reason', '')), user_data.get('user_was_online', ''),
-                        user_data.get('phone', ''), '', checked_by
+                        safe_str_convert(phone), 
+                        "Yes", 
+                        safe_str_convert(user_data.get('id', '')), 
+                        safe_str_convert(user_data.get('username', '')),
+                        usernames_str, 
+                        safe_str_convert(user_data.get('first_name', '')), 
+                        safe_str_convert(user_data.get('last_name', '')),
+                        safe_str_convert(user_data.get('fake', '')), 
+                        safe_str_convert(user_data.get('verified', '')), 
+                        safe_str_convert(user_data.get('premium', '')),
+                        safe_str_convert(user_data.get('mutual_contact', '')), 
+                        safe_str_convert(user_data.get('bot', '')),
+                        safe_str_convert(user_data.get('bot_chat_history', '')), 
+                        safe_str_convert(user_data.get('restricted', '')),
+                        safe_str_convert(user_data.get('restriction_reason', '')), 
+                        safe_str_convert(user_data.get('user_was_online', '')),
+                        safe_str_convert(user_data.get('phone', '')), 
+                        '', 
+                        safe_str_convert(checked_by)
                     ]
                 else:
                     error_msg = user_data.get('error') if user_data else "No data returned"
-                    row = [phone, "No", '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', 
-                          error_msg, checked_by]
+                    row = [
+                        safe_str_convert(phone), 
+                        "No", 
+                        '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', 
+                        safe_str_convert(error_msg), 
+                        safe_str_convert(checked_by)
+                    ]
                 writer.writerow(row)
     except Exception as e:
         logger.error(f"Ошибка при сохранении результатов: {e}")
@@ -461,35 +576,35 @@ async def main():
     batch_start = int(sys.argv[4]) if len(sys.argv) > 4 else 0
     batch_end = int(sys.argv[5]) if len(sys.argv) > 5 else None
     config_file = sys.argv[6] if len(sys.argv) > 6 else "config.yaml"
-    
+
     # Инициализация менеджера аккаунтов
     account_manager = AccountManager(config_file)
-    
+
     # Создаем пример конфигурации если нужно
     if not os.path.exists(config_file) and not os.path.exists('config.example.yaml'):
         account_manager.save_example_config()
-    
+
     logger.info(f"Входной файл: {input_csv}")
     logger.info(f"Выходной файл: {output_csv}")
     logger.info(f"Размер батча: {batch_size}")
     logger.info(f"Конфигурационный файл: {config_file}")
     logger.info(f"Количество доступных аккаунтов: {len(account_manager.accounts)}")
-    
+
     batches = read_phone_numbers(input_csv, batch_size)
-    batches = batches[batch_start:batch_end]
+    batches = batches[batch_start:batch_end] if batch_end is not None else batches[batch_start:]
     if not batches:
         logger.info("Не найдено номеров для обработки.")
         return
 
     total_numbers = sum(len(b) for b in batches)
     logger.info(f"Найдено {total_numbers} номеров в {len(batches)} батчах.")
-    
+
     try:
         processed_count = 0
-        
+
         for i, batch in enumerate(batches, 1):
             logger.info(f"\n--- Обработка батча {i}/{len(batches)} ---")
-            
+
             # Проверяем, есть ли аккаунт с доступным лимитом для этого батча
             account = account_manager.get_next_account(batch_size=len(batch))
             if not account:
@@ -497,38 +612,38 @@ async def main():
                 break
 
             client = await account_manager.get_client(account)
-            
+
             # Получаем настройки пауз из конфигурации
             pause_min = 120
             pause_max = 180
             if hasattr(account_manager, 'accounts') and account_manager.accounts:
                 # Если есть настройки в конфигурации
                 for acc in account_manager.accounts:
-                    if acc['phone_number'] == account['phone_number']:
+                    if acc.get('phone_number') == account.get('phone_number'):
                         pause_min = acc.get('request_pause_min', 120)
                         pause_max = acc.get('request_pause_max', 180)
                         break
-            
+
             # Проверяем номера текущего батча
             result_data = await validate_users(
-                client, 
-                batch, 
+                client,
+                batch,
                 download_profile_photos=False,
                 pause_min=pause_min,
                 pause_max=pause_max
             )
             logger.info(result_data)
-            
+
             if result_data:
                 parse_and_save_results(result_data, output_csv, account['phone_number'])
                 processed_count += len(batch)
                 # Увеличиваем счетчик лимита для аккаунта
                 account_manager.increment_account_limit(account['phone_number'], len(batch))
                 logger.info(f"Успешно обработано {len(batch)} номеров аккаунтом {account['phone_number']}.")
-                logger.info(f"Сегодня этим аккаунтом проверено: {account_manager.get_account_limit(account['phone_number'])} из {ACCOUNT_DAILY_LIMIT}")
+                logger.info(f"Сегодня этим аккаунтом проверено: {account_manager.get_account_limit(account['phone_number'])} из {account_manager.get_account_daily_limit(account['phone_number'])}")
             else:
                 logger.error(f"Ошибка при обработке батча {i}. Результаты не получены.")
-            
+
             # Пауза между батчами (если это не последний батч)
             if i < len(batches):
                 pause_duration = account_manager.batch_pause
