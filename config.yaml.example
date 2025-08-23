@@ -21,3 +21,7 @@ settings:
   # Глобальные настройки пауз между запросами (если не указаны для аккаунта)
   request_pause_min: 120
   request_pause_max: 180
+  input_csv: phone_numbers_group_1_all.csv
+  output_csv: telegram_check_results.csv
+  batch_size: 10
+  batches_per_run: 1
