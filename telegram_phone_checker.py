@@ -89,6 +89,10 @@ class AccountManager:
         self.batch_pause = 120  # Значение по умолчанию в секундах
         self.account_limits = load_account_limits()
         self.account_daily_limits = {}  # phone_number -> daily_limit
+        self.input_csv = "phone_numbers.csv"
+        self.output_csv = "telegram_check_results.csv"
+        self.batch_size = 10
+        self.batches_per_run = None  # Новое поле для количества батчей за запуск
         self.load_config()
 
     def load_config(self):
@@ -116,10 +120,17 @@ class AccountManager:
                         logger.error("В конфигурации не найдено ни одного аккаунта.")
                         self.load_from_env()
                         return
-                    # Загружаем настройки пауз
+                    # Загружаем настройки из секции settings
                     if 'settings' in config and config['settings']:
-                        self.batch_pause = config['settings'].get('batch_pause_seconds', 120)
+                        settings = config['settings']
+                        self.batch_pause = settings.get('batch_pause_seconds', 120)
+                        self.input_csv = settings.get('input_csv', self.input_csv)
+                        self.output_csv = settings.get('output_csv', self.output_csv)
+                        self.batch_size = settings.get('batch_size', self.batch_size)
+                        self.batches_per_run = settings.get('batches_per_run', self.batches_per_run)
                         logger.info(f"Пауза между батчами установлена: {self.batch_pause} секунд")
+                        logger.info(f"Файл входа: {self.input_csv}, файл выхода: {self.output_csv}")
+                        logger.info(f"batch_size: {self.batch_size}, batches_per_run: {self.batches_per_run}")
             except Exception as e:
                 logger.error(f"Ошибка при загрузке YAML конфигурации: {e}")
                 self.load_from_env()
@@ -290,7 +301,11 @@ class AccountManager:
             'settings': {
                 'batch_pause_seconds': 120,
                 'request_pause_min': 120,
-                'request_pause_max': 180
+                'request_pause_max': 180,
+                'input_csv': 'phone_numbers.csv',
+                'output_csv': 'telegram_check_results.csv',
+                'batch_size': 10,
+                'batches_per_run': 5
             }
         }
 
@@ -564,46 +579,93 @@ def parse_and_save_results(results_data: Dict[str, Any], output_file: str, check
 
 
 # ==============================================================================
+# Работа с состоянием батчей (batch_state.yaml)
+# ==============================================================================
+
+BATCH_STATE_FILE = "batch_state.yaml"
+
+def load_batch_state() -> dict:
+    """Загружает состояние батчей из batch_state.yaml."""
+    if os.path.exists(BATCH_STATE_FILE):
+        try:
+            with open(BATCH_STATE_FILE, "r", encoding="utf-8") as f:
+                state = yaml.safe_load(f)
+                if isinstance(state, dict):
+                    return state
+        except Exception as e:
+            logger.error(f"Ошибка при чтении batch_state.yaml: {e}")
+    return {}
+
+def save_batch_state(batch_start: int):
+    """Сохраняет состояние батчей в batch_state.yaml."""
+    try:
+        with open(BATCH_STATE_FILE, "w", encoding="utf-8") as f:
+            yaml.dump({"batch_start": batch_start}, f, default_flow_style=False, allow_unicode=True)
+        logger.info(f"Состояние батчей сохранено: batch_start={batch_start}")
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении batch_state.yaml: {e}")
+
+# ==============================================================================
 # Основная логика программы
 # ==============================================================================
 
 async def main():
     """Основная асинхронная функция программы."""
-    # --- Настройки из аргументов командной строки ---
-    input_csv = sys.argv[1] if len(sys.argv) > 1 else "phone_numbers.csv"
-    output_csv = sys.argv[2] if len(sys.argv) > 2 else "telegram_check_results.csv"
-    batch_size = int(sys.argv[3]) if len(sys.argv) > 3 else 10
-    batch_start = int(sys.argv[4]) if len(sys.argv) > 4 else 0
-    batch_end = int(sys.argv[5]) if len(sys.argv) > 5 else None
-    config_file = sys.argv[6] if len(sys.argv) > 6 else "config.yaml"
 
-    # Инициализация менеджера аккаунтов
+    # --- Чтение config.yaml и batch_state.yaml ---
+    config_file = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
     account_manager = AccountManager(config_file)
 
     # Создаем пример конфигурации если нужно
     if not os.path.exists(config_file) and not os.path.exists('config.example.yaml'):
         account_manager.save_example_config()
 
+    # Читаем настройки из config.yaml (settings)
+    input_csv = account_manager.input_csv
+    output_csv = account_manager.output_csv
+    batch_size = account_manager.batch_size
+    batches_per_run = account_manager.batches_per_run
+
+    # Читаем состояние батчей
+    batch_state = load_batch_state()
+    batch_start = batch_state.get("batch_start", 0)
+
     logger.info(f"Входной файл: {input_csv}")
     logger.info(f"Выходной файл: {output_csv}")
     logger.info(f"Размер батча: {batch_size}")
     logger.info(f"Конфигурационный файл: {config_file}")
     logger.info(f"Количество доступных аккаунтов: {len(account_manager.accounts)}")
+    logger.info(f"batch_start (из batch_state.yaml): {batch_start}")
+    logger.info(f"batches_per_run: {batches_per_run}")
 
+    # Читаем все батчи
     batches = read_phone_numbers(input_csv, batch_size)
-    batches = batches[batch_start:batch_end] if batch_end is not None else batches[batch_start:]
+    total_batches = len(batches)
     if not batches:
         logger.info("Не найдено номеров для обработки.")
         return
 
-    total_numbers = sum(len(b) for b in batches)
-    logger.info(f"Найдено {total_numbers} номеров в {len(batches)} батчах.")
+    # Определяем диапазон батчей для обработки
+    if batches_per_run is not None:
+        batch_end = batch_start + batches_per_run
+        batches_to_process = batches[batch_start:batch_end]
+    else:
+        batches_to_process = batches[batch_start:]
+
+    if not batches_to_process:
+        logger.info("Нет батчей для обработки (возможно, все уже обработаны).")
+        return
+
+    total_numbers = sum(len(b) for b in batches_to_process)
+    logger.info(f"Найдено {total_numbers} номеров в {len(batches_to_process)} батчах для обработки.")
 
     try:
         processed_count = 0
+        next_batch_start = batch_start
 
-        for i, batch in enumerate(batches, 1):
-            logger.info(f"\n--- Обработка батча {i}/{len(batches)} ---")
+        for i, batch in enumerate(batches_to_process, 1):
+            current_batch_index = batch_start + i - 1
+            logger.info(f"\n--- Обработка батча {current_batch_index+1}/{total_batches} (локально {i}/{len(batches_to_process)}) ---")
 
             # Проверяем, есть ли аккаунт с доступным лимитом для этого батча
             account = account_manager.get_next_account(batch_size=len(batch))
@@ -641,11 +703,16 @@ async def main():
                 account_manager.increment_account_limit(account['phone_number'], len(batch))
                 logger.info(f"Успешно обработано {len(batch)} номеров аккаунтом {account['phone_number']}.")
                 logger.info(f"Сегодня этим аккаунтом проверено: {account_manager.get_account_limit(account['phone_number'])} из {account_manager.get_account_daily_limit(account['phone_number'])}")
+                # После успешной обработки батча увеличиваем next_batch_start
+                next_batch_start = current_batch_index + 1
+                save_batch_state(next_batch_start)
             else:
-                logger.error(f"Ошибка при обработке батча {i}. Результаты не получены.")
+                logger.error(f"Ошибка при обработке батча {current_batch_index+1}. Результаты не получены.")
+                # Не увеличиваем next_batch_start, чтобы повторить этот батч в следующий раз
+                break
 
             # Пауза между батчами (если это не последний батч)
-            if i < len(batches):
+            if i < len(batches_to_process):
                 pause_duration = account_manager.batch_pause
                 logger.info(f"Пауза между батчами: {pause_duration} секунд...")
                 await asyncio.sleep(pause_duration)
@@ -654,6 +721,7 @@ async def main():
         logger.info("Обработка завершена.")
         logger.info(f"Всего обработано номеров: {processed_count} из {total_numbers}")
         logger.info(f"Результаты сохранены в файле: {output_csv}")
+        logger.info(f"Следующий запуск начнется с батча: {next_batch_start}")
         logger.info("======================================")
 
     except Exception as e:
