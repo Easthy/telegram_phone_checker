@@ -53,11 +53,15 @@ def load_account_limits() -> Dict[str, Dict[str, int]]:
         try:
             with open(ACCOUNT_LIMITS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                # Очищаем устаревшие даты
-                today = datetime.date.today().isoformat()
-                for phone in list(data.keys()):
-                    if today not in data[phone]:
-                        data[phone] = {today: 0}
+                # Не трогаем старые даты и не затираем данные по аккаунтам
+                # Просто убеждаемся, что структура корректна (dict[str, dict[str, int]])
+                if not isinstance(data, dict):
+                    logger.error("account_limits.json поврежден, ожидается словарь.")
+                    return {}
+                for phone, date_dict in data.items():
+                    if not isinstance(date_dict, dict):
+                        logger.warning(f"Некорректные данные по аккаунту {phone} в account_limits.json, пропускаем.")
+                        data[phone] = {}
                 return data
         except Exception as e:
             logger.error(f"Ошибка при загрузке лимитов аккаунтов: {e}")
@@ -172,8 +176,13 @@ class AccountManager:
         return self.account_daily_limits.get(phone_number, ACCOUNT_DAILY_LIMIT)
 
     def increment_account_limit(self, phone_number: str, count: int):
+        """
+        Увеличивает счетчик лимита для аккаунта на сегодня.
+        Не затирает данные по другим датам и не сбрасывает счетчики при изменении лимита.
+        """
         today = get_today_str()
-        if phone_number not in self.account_limits:
+        # Гарантируем, что структура словаря не затирается
+        if phone_number not in self.account_limits or not isinstance(self.account_limits[phone_number], dict):
             self.account_limits[phone_number] = {}
         if today not in self.account_limits[phone_number]:
             self.account_limits[phone_number][today] = 0
@@ -632,7 +641,6 @@ async def main():
 
     logger.info(f"Входной файл: {input_csv}")
     logger.info(f"Выходной файл: {output_csv}")
-    logger.info(f"Размер батча: {batch_size}")
     logger.info(f"Конфигурационный файл: {config_file}")
     logger.info(f"Количество доступных аккаунтов: {len(account_manager.accounts)}")
     logger.info(f"batch_start (из batch_state.yaml): {batch_start}")
